@@ -30,16 +30,28 @@ data class VideoSearchResponse(
                 val title = snippet["title"] as? String ?: ""
                 val titleLower = title.lowercase()
                 
-                // 제목에 검색어의 모든 단어가 포함되어 있는지 확인 (대소문자 구분 없음)
-                // 검색어가 여러 단어인 경우, 모든 단어가 제목에 포함되어야 함
-                val titleContainsAllWords = if (searchWords.isNotEmpty()) {
+                // 제목에 검색어가 포함되어 있는지 확인 (대소문자 구분 없음)
+                // 검색어가 여러 단어인 경우:
+                // - 1단어: 정확히 포함되어야 함
+                // - 2단어 이상: 검색어 전체가 포함되거나, 주요 단어들이 포함되어야 함
+                val titleContainsKeyword = if (searchWords.size == 1) {
+                    // 1단어는 정확히 포함되어야 함
+                    titleLower.contains(searchWords[0])
+                } else if (searchWords.size == 2) {
+                    // 2단어는 모두 포함되어야 함
                     searchWords.all { word -> titleLower.contains(word) }
+                } else if (searchWords.isNotEmpty()) {
+                    // 3단어 이상은 검색어 전체가 포함되거나, 2/3 이상의 단어가 포함되어야 함
+                    val searchKeywordInTitle = titleLower.contains(searchKeyword)
+                    val matchedWords = searchWords.count { word -> titleLower.contains(word) }
+                    val requiredMatches = (searchWords.size * 2 / 3.0).toInt() + 1
+                    searchKeywordInTitle || matchedWords >= requiredMatches
                 } else {
                     // 검색어가 없거나 공백만 있는 경우 원래 검색어 전체가 포함되어야 함
                     titleLower.contains(searchKeyword)
                 }
                 
-                if (!titleContainsAllWords) {
+                if (!titleContainsKeyword) {
                     return@mapNotNull null
                 }
                 

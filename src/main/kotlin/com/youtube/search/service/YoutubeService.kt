@@ -30,13 +30,14 @@ class YoutubeService(
                            isShortsFilter
         
         val searchResults = request.maxResults ?: 25
-        // 제목 필터링을 위해 더 많은 결과를 가져옴 (최대 50개)
-        // 제목 필터링이 적용되므로 더 많은 결과를 가져와야 함
-        // shorts 필터링의 경우 더 많은 결과가 필요 (1분 미만은 적을 수 있음)
+        // 제목 필터링이 항상 적용되므로 더 많은 결과를 가져와야 함
+        // 제목 필터링으로 인해 많은 결과가 필터링될 수 있으므로 충분히 가져옴
+        // 첫 페이지에서 결과가 없을 수 있으므로 더 많이 가져옴
         val fetchCount = if (needsFiltering) {
-            if (isShortsFilter) minOf(searchResults * 10, 50) else minOf(searchResults * 5, 50)
+            if (isShortsFilter) minOf(searchResults * 20, 50) else minOf(searchResults * 15, 50)
         } else {
-            minOf(searchResults * 3, 50)
+            // 제목 필터링만 적용되는 경우에도 충분히 가져옴
+            minOf(searchResults * 10, 50)
         }
         
         // shorts인 경우 short로 변환하여 YouTube API에 요청
@@ -75,15 +76,119 @@ class YoutubeService(
             .bodyToMono<Map<String, Any>>()
             .timeout(Duration.ofSeconds(10))
         
-        return if (needsFiltering) {
-            searchResponse.flatMap { response ->
+        // 제목 필터링은 항상 적용되므로, 필터링 후 결과가 부족하면 추가로 가져와야 함
+        return searchResponse.flatMap { response ->
+            val filteredResponse = if (needsFiltering) {
+                // 조회수/구독자수 필터링이 필요한 경우
                 enrichAndFilterVideos(response, request, searchResults)
+            } else {
+                // 제목 필터링만 적용
+                Mono.just(VideoSearchResponse.fromApiResponse(response, request))
             }
-        } else {
-            searchResponse.map { response ->
-                VideoSearchResponse.fromApiResponse(response, request)
+            
+            filteredResponse.flatMap { filtered ->
+                // 필터링 후 결과가 없거나 부족하면 추가로 가져오기
+                // 첫 페이지에서 결과가 없을 수 있으므로 최대 5번까지 시도
+                if (filtered.videos.isEmpty() || (filtered.videos.size < searchResults && filtered.nextPageToken != null)) {
+                    val maxAttempts = if (filtered.videos.isEmpty()) 5 else 3
+                    fetchMoreWithTitleFilter(response, request, searchResults, filtered.videos, maxAttempts)
+                } else {
+                    Mono.just(filtered)
+                }
             }
         }
+    }
+    
+    /**
+     * 제목 필터링 후 결과가 부족할 때 추가로 가져오는 함수
+     */
+    private fun fetchMoreWithTitleFilter(
+        previousResponse: Map<String, Any>,
+        request: VideoSearchRequest,
+        targetCount: Int,
+        currentVideos: List<com.youtube.search.dto.VideoInfo>,
+        maxAttempts: Int
+    ): Mono<VideoSearchResponse> {
+        if (maxAttempts <= 0 || currentVideos.size >= targetCount) {
+            @Suppress("UNCHECKED_CAST")
+            val pageInfo = previousResponse["pageInfo"] as? Map<String, Any>
+            val totalResults = (pageInfo?.get("totalResults") as? Number)?.toLong() ?: 0L
+            return Mono.just(VideoSearchResponse(
+                videos = currentVideos.take(targetCount),
+                totalResults = totalResults,
+                nextPageToken = previousResponse["nextPageToken"] as? String,
+                prevPageToken = previousResponse["prevPageToken"] as? String
+            ))
+        }
+        
+        val nextPageToken = previousResponse["nextPageToken"] as? String
+        if (nextPageToken == null) {
+            @Suppress("UNCHECKED_CAST")
+            val pageInfo = previousResponse["pageInfo"] as? Map<String, Any>
+            val totalResults = (pageInfo?.get("totalResults") as? Number)?.toLong() ?: 0L
+            return Mono.just(VideoSearchResponse(
+                videos = currentVideos.take(targetCount),
+                totalResults = totalResults,
+                nextPageToken = null,
+                prevPageToken = previousResponse["prevPageToken"] as? String
+            ))
+        }
+        
+        // 다음 페이지 가져오기
+        val nextRequest = request.copy(pageToken = nextPageToken)
+        val fetchCount = minOf(targetCount * 5, 50)
+        
+        return webClient.get()
+            .uri { uriBuilder ->
+                uriBuilder
+                    .path("/search")
+                    .queryParam("part", "snippet")
+                    .queryParam("q", request.keyword)
+                    .queryParam("type", "video")
+                    .queryParam("maxResults", fetchCount)
+                    .queryParam("order", request.order ?: "relevance")
+                    .queryParam("key", youtubeApiProperties.key)
+                    .queryParam("pageToken", nextPageToken)
+                    .apply {
+                        request.publishedAfter?.let { queryParam("publishedAfter", it) }
+                        request.publishedBefore?.let { queryParam("publishedBefore", it) }
+                        val apiVideoDuration = if (request.videoDuration == "shorts") "short" else request.videoDuration
+                        apiVideoDuration?.let { queryParam("videoDuration", it) }
+                        request.videoDefinition?.let { queryParam("videoDefinition", it) }
+                        request.videoLicense?.let { queryParam("videoLicense", it) }
+                    }
+                    .build()
+            }
+            .retrieve()
+            .onStatus({ it.isError }) { response ->
+                response.bodyToMono<String>()
+                    .defaultIfEmpty("Unknown error")
+                    .flatMap { body ->
+                        Mono.error<Throwable>(
+                            RuntimeException("YouTube API error (${response.statusCode()}): $body")
+                        )
+                    }
+            }
+            .bodyToMono<Map<String, Any>>()
+            .timeout(Duration.ofSeconds(10))
+            .flatMap { response ->
+                val filteredResponse = VideoSearchResponse.fromApiResponse(response, request)
+                val combinedVideos = currentVideos + filteredResponse.videos
+                
+                if (combinedVideos.size < targetCount && filteredResponse.nextPageToken != null && maxAttempts > 1) {
+                    fetchMoreWithTitleFilter(response, request, targetCount, combinedVideos, maxAttempts - 1)
+                } else {
+                    @Suppress("UNCHECKED_CAST")
+                    val pageInfo = response["pageInfo"] as? Map<String, Any>
+                    val totalResults = (pageInfo?.get("totalResults") as? Number)?.toLong() ?: 0L
+                    Mono.just(VideoSearchResponse(
+                        videos = combinedVideos.take(targetCount),
+                        totalResults = totalResults,
+                        nextPageToken = filteredResponse.nextPageToken,
+                        prevPageToken = filteredResponse.prevPageToken
+                    ))
+                }
+            }
     }
     
     private fun enrichAndFilterVideos(
@@ -243,16 +348,28 @@ class YoutubeService(
             val title = snippet["title"] as? String ?: ""
             val titleLower = title.lowercase()
             
-            // 제목에 검색어의 모든 단어가 포함되어 있는지 확인 (대소문자 구분 없음)
-            // 검색어가 여러 단어인 경우, 모든 단어가 제목에 포함되어야 함
-            val titleContainsAllWords = if (searchWords.isNotEmpty()) {
+            // 제목에 검색어가 포함되어 있는지 확인 (대소문자 구분 없음)
+            // 검색어가 여러 단어인 경우:
+            // - 1단어: 정확히 포함되어야 함
+            // - 2단어 이상: 검색어 전체가 포함되거나, 주요 단어들이 포함되어야 함
+            val titleContainsKeyword = if (searchWords.size == 1) {
+                // 1단어는 정확히 포함되어야 함
+                titleLower.contains(searchWords[0])
+            } else if (searchWords.size == 2) {
+                // 2단어는 모두 포함되어야 함
                 searchWords.all { word -> titleLower.contains(word) }
+            } else if (searchWords.isNotEmpty()) {
+                // 3단어 이상은 검색어 전체가 포함되거나, 2/3 이상의 단어가 포함되어야 함
+                val searchKeywordInTitle = titleLower.contains(searchKeyword)
+                val matchedWords = searchWords.count { word -> titleLower.contains(word) }
+                val requiredMatches = (searchWords.size * 2 / 3.0).toInt() + 1
+                searchKeywordInTitle || matchedWords >= requiredMatches
             } else {
                 // 검색어가 없거나 공백만 있는 경우 원래 검색어 전체가 포함되어야 함
                 titleLower.contains(searchKeyword)
             }
             
-            if (!titleContainsAllWords) {
+            if (!titleContainsKeyword) {
                 return@mapNotNull null
             }
             
