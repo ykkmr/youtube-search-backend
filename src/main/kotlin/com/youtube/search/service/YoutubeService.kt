@@ -23,13 +23,24 @@ class YoutubeService(
         
         // 조회수 필터링이 필요한 경우 더 많은 결과를 가져와야 함
         // 제목 필터링도 추가되므로 더 많은 결과를 가져와야 함
+        // shorts (1분 미만) 필터링도 영상 상세 정보가 필요하므로 필터링 필요
+        val isShortsFilter = request.videoDuration == "shorts"
         val needsFiltering = request.minViewCount != null || request.maxViewCount != null || 
-                           request.minSubscriberCount != null || request.maxSubscriberCount != null
+                           request.minSubscriberCount != null || request.maxSubscriberCount != null ||
+                           isShortsFilter
         
         val searchResults = request.maxResults ?: 25
         // 제목 필터링을 위해 더 많은 결과를 가져옴 (최대 50개)
         // 제목 필터링이 적용되므로 더 많은 결과를 가져와야 함
-        val fetchCount = if (needsFiltering) minOf(searchResults * 5, 50) else minOf(searchResults * 3, 50)
+        // shorts 필터링의 경우 더 많은 결과가 필요 (1분 미만은 적을 수 있음)
+        val fetchCount = if (needsFiltering) {
+            if (isShortsFilter) minOf(searchResults * 10, 50) else minOf(searchResults * 5, 50)
+        } else {
+            minOf(searchResults * 3, 50)
+        }
+        
+        // shorts인 경우 short로 변환하여 YouTube API에 요청
+        val apiVideoDuration = if (request.videoDuration == "shorts") "short" else request.videoDuration
         
         val searchResponse = webClient.get()
             .uri { uriBuilder ->
@@ -44,7 +55,7 @@ class YoutubeService(
                     .apply {
                         request.publishedAfter?.let { queryParam("publishedAfter", it) }
                         request.publishedBefore?.let { queryParam("publishedBefore", it) }
-                        request.videoDuration?.let { queryParam("videoDuration", it) }
+                        apiVideoDuration?.let { queryParam("videoDuration", it) }
                         request.videoDefinition?.let { queryParam("videoDefinition", it) }
                         request.videoLicense?.let { queryParam("videoLicense", it) }
                         request.pageToken?.let { queryParam("pageToken", it) }
@@ -251,6 +262,15 @@ class YoutubeService(
             val stats = videoStatsMap[id] ?: emptyMap()
             val viewCount = stats["viewCount"] as? Long ?: 0L
             val subscriberCount = channelStatsMap[channelId] ?: 0L
+            val duration = stats["duration"] as? String
+            
+            // shorts 필터링: 1분 미만인지 확인
+            if (request.videoDuration == "shorts") {
+                val durationInSeconds = parseDurationToSeconds(duration)
+                if (durationInSeconds == null || durationInSeconds >= 60) {
+                    return@mapNotNull null
+                }
+            }
             
             // 필터링 조건 확인
             if (request.minViewCount != null && viewCount < request.minViewCount) return@mapNotNull null
@@ -281,6 +301,43 @@ class YoutubeService(
         }
         
         return filtered.take(maxResults)
+    }
+    
+    /**
+     * YouTube API의 duration 형식 (ISO 8601, 예: PT1M30S)을 초 단위로 변환
+     * PT1M30S = 1분 30초 = 90초
+     */
+    private fun parseDurationToSeconds(duration: String?): Int? {
+        if (duration == null || duration.isBlank()) return null
+        
+        try {
+            // PT1H2M30S 형식 파싱
+            var totalSeconds = 0
+            var currentNumber = ""
+            
+            for (char in duration) {
+                when (char) {
+                    'P', 'T' -> continue // 시작 문자 무시
+                    'H' -> {
+                        totalSeconds += (currentNumber.toIntOrNull() ?: 0) * 3600
+                        currentNumber = ""
+                    }
+                    'M' -> {
+                        totalSeconds += (currentNumber.toIntOrNull() ?: 0) * 60
+                        currentNumber = ""
+                    }
+                    'S' -> {
+                        totalSeconds += currentNumber.toIntOrNull() ?: 0
+                        currentNumber = ""
+                    }
+                    in '0'..'9' -> currentNumber += char
+                }
+            }
+            
+            return totalSeconds
+        } catch (e: Exception) {
+            return null
+        }
     }
     
     fun getVideoDetails(videoIds: List<String>): Mono<Map<String, Any>> {
